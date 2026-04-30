@@ -5,55 +5,64 @@ import os
 import json
 import streamlit.components.v1 as components
 
-# ===================== 1. 核心配置与移动端 UI 补丁 =====================
+# ===================== 1. 核心配置与移动端 UI 增强 =====================
 DBC_FILENAME = 'Geely_TMCU_V1.1_20250513_PrivateCAN_10.dbc'
 st.set_page_config(page_title="HVFAN 报文分析系统", layout="wide")
 
-# 针对移动端兼容性的深度 CSS 修复
+# 深度 CSS 补丁：解决移动端“点不到”和“布局乱”的问题
 st.markdown("""
     <style>
-    /* 提升上传组件层级，确保在手机端可被点击，防止被隐形层遮挡 */
+    /* 1. 提升上传组件层级，防止在手机端被隐形层遮挡 */
     .stFileUploader {
         position: relative; 
         z-index: 1000 !important; 
     }
-    /* 增大手机端的点击热区，解决“选不中”感官问题 */
+    /* 2. 极大增强手机端点击热区，解决“选不中”感官问题 */
     section[data-testid="stFileUploadDropzone"] {
-        padding: 2.5rem 1rem !important;
+        padding: 3rem 1rem !important;
         border: 2px dashed #3498db !important;
         background-color: #f0f7ff !important;
-        border-radius: 12px;
+        border-radius: 15px;
     }
-    /* 适配手机窄屏字体 */
+    /* 3. 移动端字体与间距微调 */
     @media (max-width: 768px) {
-        .stMarkdown h1 { font-size: 1.3rem !important; }
-        .st-emotion-cache-16idsys p { font-size: 14px !important; }
+        .stMarkdown h1 { font-size: 1.2rem !important; }
+        .st-emotion-cache-16idsys p { font-size: 13px !important; }
+        .stMultiSelect div div { font-size: 12px !important; }
     }
     </style>
 """, unsafe_allow_html=True)
 
-# ===================== 2. 解析引擎 (完整保留原功能) =====================
+# ===================== 2. 高性能解析引擎 =====================
 
 @st.cache_resource
 def load_dbc_engine(uploaded_file_content=None):
+    """
+    缓存 DBC 加载，避免重复解析协议文件
+    """
     try:
         if uploaded_file_content is not None:
-            dbc_content = uploaded_file_content.decode('gbk', errors='ignore')
-            return cantools.database.load_string(dbc_content, strict=False)
+            # 兼容处理上传的 DBC
+            dbc_text = uploaded_file_content.decode('gbk', errors='ignore')
+            return cantools.database.load_string(dbc_text, strict=False)
         elif os.path.exists(DBC_FILENAME):
+            # 加载本地默认 DBC
             return cantools.database.load_file(DBC_FILENAME, encoding='gbk', strict=False)
     except Exception as e:
-        st.sidebar.error(f"DBC解析失败: {str(e)}")
+        st.sidebar.error(f"DBC 解析失败: {e}")
     return None
 
 def process_asc(file_content, db):
+    """
+    ASC 报文解析逻辑，包含 J1939 ID 模糊匹配
+    """
     data_dict = {}
     frame_re = re.compile(
         r'^\s*(?P<time>\d+\.\d+)\s+(?P<channel>\d+)\s+(?P<id>[0-9A-Fa-f]+)x\s+(?:Rx|Tx)\s+d\s+(?P<dlc>\d+)\s+(?P<data>(?:[0-9A-Fa-f]{2}\s*)+)', 
         re.MULTILINE
     )
     
-    # 尝试多种编码读取 ASC
+    # 自动识别编码逻辑
     text_data = ""
     for enc in ['utf-8', 'gbk', 'latin-1']:
         try:
@@ -71,7 +80,7 @@ def process_asc(file_content, db):
                 hex_data = m.group('data').strip().replace(' ', '')
                 raw_payload = bytearray.fromhex(hex_data)
                 
-                # J1939 ID 模糊匹配逻辑
+                # 核心：ID 模糊匹配（处理 J1939 优先级差异）
                 msg = None
                 for search_id in [raw_id, raw_id & 0x1FFFFFFF, raw_id & 0x00FFFFFF]:
                     try:
@@ -94,7 +103,7 @@ def process_asc(file_content, db):
                         sig_obj = msg.get_signal_by_name(s_n)
                         data_dict[full_n] = {
                             'x': [], 'y': [], 
-                            'unit': sig_obj.unit or "",
+                            'unit': sig_obj.unit if sig_obj.unit else "",
                             'label': s_n
                         }
                     data_dict[full_n]['x'].append(t)
@@ -102,130 +111,135 @@ def process_asc(file_content, db):
             except: continue
     return data_dict
 
-# ===================== 3. UI 交互与逻辑集成 =====================
+# ===================== 3. UI 布局与交互控制 =====================
 
-st.title("🚗 HVFAN 报文分析系统")
+st.title("🚗 HVFAN 移动端分析系统")
 
-# 侧边栏：DBC 设置 (type=None 解决 iOS 无法选中问题)
+# 侧边栏：DBC 协议管理
 with st.sidebar:
-    st.header("⚙️ 协议库设置")
-    uploaded_dbc = st.file_uploader("手动上传 DBC 文件", type=None, key="mobile_dbc_uploader")
-    st.caption("提示：若文件置灰，请重命名并在末尾加 .txt")
+    st.header("⚙️ 协议库配置")
+    uploaded_dbc = st.file_uploader("更新 DBC 文件", type=None, key="mobile_dbc_uploader")
+    st.info("提示：若自动解析不出信号，请手动上传匹配的 DBC。")
 
-# 加载 DBC
+# 加载协议引擎
 dbc_bytes = uploaded_dbc.read() if uploaded_dbc else None
 db = load_dbc_engine(dbc_bytes)
 
+# 逻辑检查：无协议不工作
 if not db:
-    st.info("👈 请先在侧边栏上传 DBC 文件或确保预设 DBC 存在以激活分析功能。")
+    st.warning("⚠️ 协议库未就绪。请确认侧边栏 DBC 状态。")
     st.stop()
 
-# ASC 上传：核心改动 type=None，解决截图中的文件置灰无法选中问题
+# ASC 上传：使用 type=None 兼容 iOS 系统
 uploaded_asc = st.file_uploader(
-    "📂 上传 ASC 原始报文文件", 
+    "📂 上传 ASC 报文 (支持 .asc / .txt)", 
     type=None, 
     key="mobile_asc_uploader"
 )
 
 if uploaded_asc is not None:
-    # 后验后缀校验，确保业务逻辑正确
-    fname = uploaded_asc.name.lower()
-    if not (fname.endswith('.asc') or fname.endswith('.txt') or fname.endswith('.csv')):
-        st.error(f"❌ 不支持的文件格式：{uploaded_asc.name}。请上传 .asc 或 .txt。")
+    # 状态持久化：避免手机切换应用导致数据丢失
+    file_key = f"cache_{uploaded_asc.name}_{uploaded_asc.size}"
+    if 'data_cache' not in st.session_state or st.session_state.get('current_file_id') != file_key:
+        with st.spinner('⏳ 正在解析大规模报文...'):
+            content = uploaded_asc.read()
+            st.session_state.data_cache = process_asc(content, db)
+            st.session_state.current_file_id = file_key
+    
+    full_data = st.session_state.data_cache
+
+    if not full_data:
+        st.error("❌ 解析失败：未发现匹配的信号 ID。")
     else:
-        # 使用 session_state 缓存解析结果，防止信号删减操作导致重复解析，造成手机卡顿
-        file_key = f"cache_{uploaded_asc.name}_{uploaded_asc.size}"
-        if 'full_data' not in st.session_state or st.session_state.get('current_file_id') != file_key:
-            with st.spinner('🔍 正在解析报文信号...'):
-                content = uploaded_asc.read()
-                st.session_state.full_data = process_asc(content, db)
-                st.session_state.current_file_id = file_key
-        
-        full_data = st.session_state.get('full_data', {})
+        st.success(f"📈 成功识别 {len(full_data)} 个信号")
 
-        if not full_data:
-            st.warning("⚠️ 未在报文中找到符合 DBC 定义的信号。")
-        else:
-            # 交互控制面板：保留【信号删减、同步缩放、辅助线】
-            with st.expander("🛠️ 信号显示与交互设置", expanded=True):
-                c1, c2, c3 = st.columns([3, 1, 1])
-                with c1:
-                    all_sig_names = sorted(full_data.keys())
-                    # 信号的删减恢复主要靠 multiselect 驱动逻辑重绘
-                    selected_sigs = st.multiselect("选择/删减分析信号:", options=all_sig_names, default=all_sig_names[:1])
-                with c2:
-                    sync_on = st.toggle("🔗 同步缩放", value=True)
-                with c3:
-                    show_measure = st.toggle("📏 辅助线", value=True)
+        # 交互面板
+        with st.expander("🛠️ 信号过滤与交互设置", expanded=True):
+            all_sigs = sorted(full_data.keys())
+            selected_sigs = st.multiselect("选择分析信号 (支持搜索)", all_sigs, default=all_sigs[:1])
+            
+            c1, c2 = st.columns(2)
+            with c1: sync_on = st.toggle("🔗 同步缩放", value=True)
+            with c2: show_measure = st.toggle("📏 开启测量轴", value=True)
 
-            if selected_sigs:
-                charts_to_render = []
-                for name in selected_sigs:
-                    d = full_data[name]
-                    x, y = d['x'], d['y']
-                    # 移动端性能优化：数据点抽稀
-                    if len(x) > 15000:
-                        step = len(x) // 15000
-                        x, y = x[::step], y[::step]
-                    charts_to_render.append({"id": f"chart_{hash(name)}", "title": f"{name} ({d['unit']})", "x": x, "y": y})
+        if selected_sigs:
+            charts_json = []
+            for name in selected_sigs:
+                d = full_data[name]
+                x, y = d['x'], d['y']
+                
+                # 移动端性能优化：动态抽稀 (超过 1.5 万个点时执行)
+                if len(x) > 15000:
+                    step = len(x) // 15000
+                    x, y = x[::step], y[::step]
+                
+                charts_json.append({
+                    "id": f"ch_{hash(name)}", 
+                    "title": f"{name} ({d['unit']})", 
+                    "x": x, 
+                    "y": y
+                })
 
-                # --- Plotly 渲染逻辑：完整保留所有交互功能 ---
-                js_logic = f"""
-                <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
-                <div id="chart-container"></div>
-                <script>
-                    const chartsData = {json.dumps(charts_to_render)};
-                    const syncEnabled = {str(sync_on).lower()};
-                    const hoverMode = "{'x unified' if show_measure else 'closest'}";
-                    const chartIds = [];
-                    let isRelayouting = false;
+            # Plotly 原生渲染引擎：兼容手机触控缩放
+            js_code = f"""
+            <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+            <div id="chart-box"></div>
+            <script>
+                const dataSet = {json.dumps(charts_json)};
+                const sync = {str(sync_on).lower()};
+                const container = document.getElementById('chart-box');
+                const chartIds = [];
+                let relayouting = false;
 
-                    const container = document.getElementById('chart-container');
-                    
-                    // 动态创建图表容器，实现信号删减恢复的实时渲染
-                    chartsData.forEach((data) => {{
-                        const div = document.createElement('div');
-                        div.id = data.id;
-                        div.style.marginBottom = '15px';
-                        div.style.height = '350px';
-                        container.appendChild(div);
-                        chartIds.push(data.id);
+                dataSet.forEach(data => {{
+                    const d = document.createElement('div');
+                    d.id = data.id;
+                    d.style.marginBottom = '20px';
+                    d.style.height = '320px';
+                    container.appendChild(d);
+                    chartIds.push(data.id);
 
-                        const layout = {{
-                            title: {{ text: data.title, font: {{ size: 13 }} }},
-                            margin: {{ l: 60, r: 30, t: 40, b: 40 }},
-                            hovermode: hoverMode,
-                            template: 'plotly_white',
-                            xaxis: {{ showspikes: true, spikemode: 'across', spikedash: 'dot' }},
-                            yaxis: {{ autorange: true }}
-                        }};
+                    const layout = {{
+                        title: {{ text: data.title, font: {{ size: 14 }} }},
+                        margin: {{ l: 50, r: 20, t: 40, b: 40 }},
+                        template: 'plotly_white',
+                        hovermode: "{'x unified' if show_measure else 'closest'}",
+                        xaxis: {{ showspikes: true, spikemode: 'across', spikedash: 'dot', spikecolor: '#999' }},
+                        yaxis: {{ autorange: true }}
+                    }};
 
-                        Plotly.newPlot(data.id, [{{ x: data.x, y: data.y, type: 'scatter', mode: 'lines', line: {{ width: 1.5, color: '#2b6cb0' }} }}], layout, {{ responsive: true, displaylogo: false }});
-
-                        // 同步缩放逻辑
-                        if (syncEnabled) {{
-                            document.getElementById(data.id).on('plotly_relayout', (eventData) => {{
-                                if (isRelayouting) return;
-                                isRelayouting = true;
-                                const update = {{}};
-                                if (eventData['xaxis.range[0]']) {{
-                                    update['xaxis.range[0]'] = eventData['xaxis.range[0]'];
-                                    update['xaxis.range[1]'] = eventData['xaxis.range[1]'];
-                                }} else if (eventData['xaxis.autorange']) {{
-                                    update['xaxis.autorange'] = true;
-                                }}
-
-                                if (Object.keys(update).length > 0) {{
-                                    const promises = chartIds.map(id => {{
-                                        if (id !== data.id) return Plotly.relayout(id, update);
-                                    }});
-                                    Promise.all(promises).then(() => {{ isRelayouting = false; }});
-                                }} else {{ isRelayouting = false; }}
-                            }});
-                        }}
+                    Plotly.newPlot(data.id, [{{ 
+                        x: data.x, 
+                        y: data.y, 
+                        type: 'scatter', 
+                        mode: 'lines', 
+                        line: {{ width: 2, color: '#1f77b4' }} 
+                    }}], layout, {{ 
+                        responsive: true, 
+                        displaylogo: false, 
+                        scrollZoom: true 
                     }});
-                </script>
-                """
-                # 动态计算 HTML 高度，确保信号增多时不会出现滚动条冲突
-                render_height = len(selected_sigs) * 365 + 50
-                components.html(js_logic, height=render_height, scrolling=False)
+
+                    // 移动端多图表联动缩放
+                    if (sync) {{
+                        document.getElementById(data.id).on('plotly_relayout', (ed) => {{
+                            if (relayouting) return;
+                            relayouting = true;
+                            const up = {{}};
+                            if (ed['xaxis.range[0]']) {{
+                                up['xaxis.range[0]'] = ed['xaxis.range[0]'];
+                                up['xaxis.range[1]'] = ed['xaxis.range[1]'];
+                            }} else if (ed['xaxis.autorange']) {{
+                                up['xaxis.autorange'] = true;
+                            }}
+                            if (Object.keys(up).length > 0) {{
+                                const ps = chartIds.map(id => id !== data.id ? Plotly.relayout(id, up) : null);
+                                Promise.all(ps).then(() => relayouting = false);
+                            }} else relayouting = false;
+                        }});
+                    }}
+                }});
+            </script>
+            """
+            # 动态计算高度，防止滚动冲突
+            components.html(js_code, height=len(selected_sigs)*350 + 50, scrolling=False)
