@@ -9,54 +9,51 @@ import streamlit.components.v1 as components
 DBC_FILENAME = 'Geely_TMCU_V1.1_20250513_PrivateCAN_10.dbc'
 st.set_page_config(page_title="HVFAN 报文分析系统", layout="wide")
 
-# 应用【方案一】：深度 CSS 修复，解决手机端点击穿透和热区过小问题
+# 针对移动端兼容性的深度 CSS 修复
 st.markdown("""
     <style>
-    /* 提升上传组件层级，防止被 Streamlit 默认的隐形 Overlay 遮挡 */
+    /* 提升上传组件层级，确保在手机端可被点击，防止被隐形层遮挡 */
     .stFileUploader {
         position: relative; 
         z-index: 1000 !important; 
     }
-    /* 增大手机端的点击热区，方便手指操作 */
+    /* 增大手机端的点击热区，解决“选不中”感官问题 */
     section[data-testid="stFileUploadDropzone"] {
         padding: 2.5rem 1rem !important;
         border: 2px dashed #3498db !important;
         background-color: #f0f7ff !important;
-        border-radius: 10px;
+        border-radius: 12px;
     }
-    /* 针对窄屏手机优化字体，防止 UI 溢出 */
+    /* 适配手机窄屏字体 */
     @media (max-width: 768px) {
         .stMarkdown h1 { font-size: 1.3rem !important; }
         .st-emotion-cache-16idsys p { font-size: 14px !important; }
-        .stButton button { width: 100%; } /* 按钮全屏宽度 */
     }
     </style>
 """, unsafe_allow_html=True)
 
-# ===================== 2. 高性能解析引擎 =====================
+# ===================== 2. 解析引擎 (完整保留原功能) =====================
 
 @st.cache_resource
 def load_dbc_engine(uploaded_file_content=None):
-    """缓存 DBC 解析结果，避免每次操作都重新解析协议文件"""
     try:
         if uploaded_file_content is not None:
-            dbc_text = uploaded_file_content.decode('gbk', errors='ignore')
-            return cantools.database.load_string(dbc_text, strict=False)
+            dbc_content = uploaded_file_content.decode('gbk', errors='ignore')
+            return cantools.database.load_string(dbc_content, strict=False)
         elif os.path.exists(DBC_FILENAME):
             return cantools.database.load_file(DBC_FILENAME, encoding='gbk', strict=False)
     except Exception as e:
-        st.error(f"DBC 解析失败: {e}")
+        st.sidebar.error(f"DBC解析失败: {str(e)}")
     return None
 
 def process_asc(file_content, db):
-    """解析 ASC 逻辑，保持不变"""
     data_dict = {}
     frame_re = re.compile(
         r'^\s*(?P<time>\d+\.\d+)\s+(?P<channel>\d+)\s+(?P<id>[0-9A-Fa-f]+)x\s+(?:Rx|Tx)\s+d\s+(?P<dlc>\d+)\s+(?P<data>(?:[0-9A-Fa-f]{2}\s*)+)', 
         re.MULTILINE
     )
     
-    # 自动识别编码
+    # 尝试多种编码读取 ASC
     text_data = ""
     for enc in ['utf-8', 'gbk', 'latin-1']:
         try:
@@ -74,13 +71,13 @@ def process_asc(file_content, db):
                 hex_data = m.group('data').strip().replace(' ', '')
                 raw_payload = bytearray.fromhex(hex_data)
                 
-                # J1939 ID 兼容逻辑
+                # J1939 ID 模糊匹配逻辑
                 msg = None
                 for search_id in [raw_id, raw_id & 0x1FFFFFFF, raw_id & 0x00FFFFFF]:
                     try:
                         msg = db.get_message_by_frame_id(search_id)
                         if msg: break
-                    except: continue
+                    except KeyError: continue
                 
                 if not msg: continue
                 if len(raw_payload) < msg.length:
@@ -91,114 +88,144 @@ def process_asc(file_content, db):
                     if not isinstance(s_v, (int, float)):
                         try: s_v = float(s_v)
                         except: continue
+
                     full_n = f"{msg.name}::{s_n}"
                     if full_n not in data_dict:
                         sig_obj = msg.get_signal_by_name(s_n)
-                        data_dict[full_n] = {'x': [], 'y': [], 'unit': sig_obj.unit or "", 'label': s_n}
+                        data_dict[full_n] = {
+                            'x': [], 'y': [], 
+                            'unit': sig_obj.unit or "",
+                            'label': s_n
+                        }
                     data_dict[full_n]['x'].append(t)
                     data_dict[full_n]['y'].append(s_v)
             except: continue
     return data_dict
 
-# ===================== 3. 业务逻辑与持久化 =====================
+# ===================== 3. UI 交互与逻辑集成 =====================
 
-# 侧边栏：配置区
+st.title("🚗 HVFAN 报文分析系统")
+
+# 侧边栏：DBC 设置 (type=None 解决 iOS 无法选中问题)
 with st.sidebar:
-    st.header("⚙️ 协议库配置")
-    # 应用【方案三】：指定 key 确保组件 ID 稳定
-    uploaded_dbc = st.file_uploader("手动上传 DBC", type=['dbc'], key="dbc_loader_mobile")
-    st.caption("注：手机端若自动加载失败，请手动上传。")
+    st.header("⚙️ 协议库设置")
+    uploaded_dbc = st.file_uploader("手动上传 DBC 文件", type=None, key="mobile_dbc_uploader")
+    st.caption("提示：若文件置灰，请重命名并在末尾加 .txt")
 
-db = load_dbc_engine(uploaded_dbc.read() if uploaded_dbc else None)
+# 加载 DBC
+dbc_bytes = uploaded_dbc.read() if uploaded_dbc else None
+db = load_dbc_engine(dbc_bytes)
 
-# 主界面
 if not db:
-    st.warning("👈 请先确保协议库 (DBC) 已加载")
+    st.info("👈 请先在侧边栏上传 DBC 文件或确保预设 DBC 存在以激活分析功能。")
     st.stop()
 
-# 应用【方案三】：上传组件置于顶层，不受逻辑分支干扰
+# ASC 上传：核心改动 type=None，解决截图中的文件置灰无法选中问题
 uploaded_asc = st.file_uploader(
-    "📂 第一步：上传 ASC 报文文件", 
-    type=['asc', 'txt'], 
-    key="asc_loader_mobile"
+    "📂 上传 ASC 原始报文文件", 
+    type=None, 
+    key="mobile_asc_uploader"
 )
 
 if uploaded_asc is not None:
-    # 应用【方案二】：使用 Session State 状态锁，防止手机端因内存回收导致的重复解析
-    file_id = f"cache_{uploaded_asc.name}_{uploaded_asc.size}"
-    
-    if 'main_data' not in st.session_state or st.session_state.get('last_file_id') != file_id:
-        with st.spinner('⏳ 正在解析大规模报文...'):
-            content = uploaded_asc.read()
-            st.session_state.main_data = process_asc(content, db)
-            st.session_state.last_file_id = file_id
-    
-    full_data = st.session_state.main_data
-
-    if not full_data:
-        st.error("❌ 未匹配到数据")
+    # 后验后缀校验，确保业务逻辑正确
+    fname = uploaded_asc.name.lower()
+    if not (fname.endswith('.asc') or fname.endswith('.txt') or fname.endswith('.csv')):
+        st.error(f"❌ 不支持的文件格式：{uploaded_asc.name}。请上传 .asc 或 .txt。")
     else:
-        # 应用【方案四】：强制抽稀，保证手机端 Plotly 图表不卡死
-        with st.expander("🛠️ 信号显示设置", expanded=True):
-            selected_sigs = st.multiselect("选择分析信号", sorted(full_data.keys()), default=sorted(full_data.keys())[:1])
-            sync_on = st.toggle("同步缩放", value=True)
+        # 使用 session_state 缓存解析结果，防止信号删减操作导致重复解析，造成手机卡顿
+        file_key = f"cache_{uploaded_asc.name}_{uploaded_asc.size}"
+        if 'full_data' not in st.session_state or st.session_state.get('current_file_id') != file_key:
+            with st.spinner('🔍 正在解析报文信号...'):
+                content = uploaded_asc.read()
+                st.session_state.full_data = process_asc(content, db)
+                st.session_state.current_file_id = file_key
+        
+        full_data = st.session_state.get('full_data', {})
 
-        if selected_sigs:
-            charts_to_draw = []
-            for name in selected_sigs:
-                d = full_data[name]
-                x, y = d['x'], d['y']
-                
-                # 移动端性能警戒线：超过 15,000 点强制抽稀
-                if len(x) > 15000:
-                    step = len(x) // 15000
-                    x, y = x[::step], y[::step]
-                
-                charts_to_draw.append({"id": f"c_{hash(name)}", "title": f"{name} ({d['unit']})", "x": x, "y": y})
+        if not full_data:
+            st.warning("⚠️ 未在报文中找到符合 DBC 定义的信号。")
+        else:
+            # 交互控制面板：保留【信号删减、同步缩放、辅助线】
+            with st.expander("🛠️ 信号显示与交互设置", expanded=True):
+                c1, c2, c3 = st.columns([3, 1, 1])
+                with c1:
+                    all_sig_names = sorted(full_data.keys())
+                    # 信号的删减恢复主要靠 multiselect 驱动逻辑重绘
+                    selected_sigs = st.multiselect("选择/删减分析信号:", options=all_sig_names, default=all_sig_names[:1])
+                with c2:
+                    sync_on = st.toggle("🔗 同步缩放", value=True)
+                with c3:
+                    show_measure = st.toggle("📏 辅助线", value=True)
 
-            # Plotly 渲染 (高度自适应移动端)
-            js_engine = f"""
-            <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
-            <div id="viz-container"></div>
-            <script>
-                const charts = {json.dumps(charts_to_draw)};
-                const isSync = {str(sync_on).lower()};
-                const container = document.getElementById('viz-container');
-                const ids = [];
-                let isLock = false;
+            if selected_sigs:
+                charts_to_render = []
+                for name in selected_sigs:
+                    d = full_data[name]
+                    x, y = d['x'], d['y']
+                    # 移动端性能优化：数据点抽稀
+                    if len(x) > 15000:
+                        step = len(x) // 15000
+                        x, y = x[::step], y[::step]
+                    charts_to_render.append({"id": f"chart_{hash(name)}", "title": f"{name} ({d['unit']})", "x": x, "y": y})
 
-                charts.forEach(data => {{
-                    const div = document.createElement('div');
-                    div.id = data.id;
-                    div.style.height = '320px'; // 针对手机屏幕调整高度
-                    div.style.marginBottom = '15px';
-                    container.appendChild(div);
-                    ids.push(data.id);
+                # --- Plotly 渲染逻辑：完整保留所有交互功能 ---
+                js_logic = f"""
+                <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+                <div id="chart-container"></div>
+                <script>
+                    const chartsData = {json.dumps(charts_to_render)};
+                    const syncEnabled = {str(sync_on).lower()};
+                    const hoverMode = "{'x unified' if show_measure else 'closest'}";
+                    const chartIds = [];
+                    let isRelayouting = false;
 
-                    const layout = {{
-                        title: {{ text: data.title, font: {{ size: 14 }} }},
-                        margin: {{ l: 50, r: 20, t: 40, b: 40 }},
-                        template: 'plotly_white',
-                        xaxis: {{ showspikes: true, spikemode: 'across' }},
-                        yaxis: {{ autorange: true }}
-                    }};
+                    const container = document.getElementById('chart-container');
+                    
+                    // 动态创建图表容器，实现信号删减恢复的实时渲染
+                    chartsData.forEach((data) => {{
+                        const div = document.createElement('div');
+                        div.id = data.id;
+                        div.style.marginBottom = '15px';
+                        div.style.height = '350px';
+                        container.appendChild(div);
+                        chartIds.push(data.id);
 
-                    Plotly.newPlot(data.id, [{{ x: data.x, y: data.y, mode: 'lines', line: {{ width: 2 }} }}], layout, {{ responsive: true, displaylogo: false }});
+                        const layout = {{
+                            title: {{ text: data.title, font: {{ size: 13 }} }},
+                            margin: {{ l: 60, r: 30, t: 40, b: 40 }},
+                            hovermode: hoverMode,
+                            template: 'plotly_white',
+                            xaxis: {{ showspikes: true, spikemode: 'across', spikedash: 'dot' }},
+                            yaxis: {{ autorange: true }}
+                        }};
 
-                    if (isSync) {{
-                        document.getElementById(data.id).on('plotly_relayout', (e) => {{
-                            if (isLock) return;
-                            isLock = true;
-                            const update = {{}};
-                            if (e['xaxis.range[0]']) {{
-                                update['xaxis.range[0]'] = e['xaxis.range[0]'];
-                                update['xaxis.range[1]'] = e['xaxis.range[1]'];
-                            }}
-                            ids.forEach(id => {{ if(id !== data.id) Plotly.relayout(id, update); }});
-                            isLock = false;
-                        }});
-                    }}
-                }});
-            </script>
-            """
-            components.html(js_engine, height=len(selected_sigs)*350 + 50)
+                        Plotly.newPlot(data.id, [{{ x: data.x, y: data.y, type: 'scatter', mode: 'lines', line: {{ width: 1.5, color: '#2b6cb0' }} }}], layout, {{ responsive: true, displaylogo: false }});
+
+                        // 同步缩放逻辑
+                        if (syncEnabled) {{
+                            document.getElementById(data.id).on('plotly_relayout', (eventData) => {{
+                                if (isRelayouting) return;
+                                isRelayouting = true;
+                                const update = {{}};
+                                if (eventData['xaxis.range[0]']) {{
+                                    update['xaxis.range[0]'] = eventData['xaxis.range[0]'];
+                                    update['xaxis.range[1]'] = eventData['xaxis.range[1]'];
+                                }} else if (eventData['xaxis.autorange']) {{
+                                    update['xaxis.autorange'] = true;
+                                }}
+
+                                if (Object.keys(update).length > 0) {{
+                                    const promises = chartIds.map(id => {{
+                                        if (id !== data.id) return Plotly.relayout(id, update);
+                                    }});
+                                    Promise.all(promises).then(() => {{ isRelayouting = false; }});
+                                }} else {{ isRelayouting = false; }}
+                            }});
+                        }}
+                    }});
+                </script>
+                """
+                # 动态计算 HTML 高度，确保信号增多时不会出现滚动条冲突
+                render_height = len(selected_sigs) * 365 + 50
+                components.html(js_logic, height=render_height, scrolling=False)
