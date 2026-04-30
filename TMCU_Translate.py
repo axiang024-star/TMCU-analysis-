@@ -7,31 +7,45 @@ import streamlit.components.v1 as components
 
 # ===================== 1. 核心配置 =====================
 DBC_FILENAME = 'Geely_TMCU_V1.1_20250513_PrivateCAN_10.dbc'
-st.set_page_config(page_title="TMCU 报文分析系统", layout="wide")
+st.set_page_config(page_title="HVFAN 报文分析系统", layout="wide")
 
-# ===================== 2. 解析引擎 =====================
+# 针对移动端兼容性的 CSS 补丁
+st.markdown("""
+    <style>
+    /* 确保上传组件层级正确，防止在移动端被 UI 遮罩遮挡 */
+    .stFileUploader {position: relative; z-index: 100;}
+    /* 优化移动端文字显示 */
+    @media (max-width: 768px) {
+        .st-emotion-cache-16idsys p { font-size: 14px; }
+        .stMarkdown h1 { font-size: 1.5rem !important; }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ===================== 2. 解析引擎 (保留原功能) =====================
 
 @st.cache_resource
-def load_dbc_engine(uploaded_file=None):
+def load_dbc_engine(uploaded_file_content=None):
     """
-    核心修复：添加 strict=False 以忽略 DBC 中的信号重叠错误
+    核心功能：加载 DBC 协议。支持 strict=False 以兼容非规范文件。
     """
     try:
-        if uploaded_file is not None:
-            # 读取上传的文件内容
-            dbc_content = uploaded_file.read().decode('gbk', errors='ignore')
-            # strict=False 允许解析包含重叠信号的非规范 DBC
+        if uploaded_file_content is not None:
+            # 解析上传的 DBC
+            dbc_content = uploaded_file_content.decode('gbk', errors='ignore')
             return cantools.database.load_string(dbc_content, strict=False)
         elif os.path.exists(DBC_FILENAME):
-            # 本地加载也需开启非严格模式
+            # 加载本地预设 DBC
             return cantools.database.load_file(DBC_FILENAME, encoding='gbk', strict=False)
     except Exception as e:
         st.sidebar.error(f"DBC解析失败: {str(e)}")
     return None
 
 def process_asc(file_content, db):
+    """
+    保留原有的 ASC 解析逻辑，支持 Vector 格式及 J1939 匹配
+    """
     data_dict = {}
-    # 针对 Vector ASC 格式的精确匹配正则
     frame_re = re.compile(
         r'^\s*(?P<time>\d+\.\d+)\s+(?P<channel>\d+)\s+(?P<id>[0-9A-Fa-f]+)x\s+(?:Rx|Tx)\s+d\s+(?P<dlc>\d+)\s+(?P<data>(?:[0-9A-Fa-f]{2}\s*)+)', 
         re.MULTILINE
@@ -56,7 +70,7 @@ def process_asc(file_content, db):
                 raw_payload = bytearray.fromhex(hex_data)
                 
                 msg = None
-                # J1939 29位扩展帧兼容性匹配逻辑
+                # 保留 ID 模糊匹配逻辑 (J1939)
                 for search_id in [raw_id, raw_id & 0x1FFFFFFF, raw_id & 0x00FFFFFF]:
                     try:
                         msg = db.get_message_by_frame_id(search_id)
@@ -65,7 +79,6 @@ def process_asc(file_content, db):
                 
                 if not msg: continue
                 
-                # 数据长度自动补齐
                 if len(raw_payload) < msg.length:
                     raw_payload = raw_payload.ljust(msg.length, b'\x00')
 
@@ -89,28 +102,29 @@ def process_asc(file_content, db):
     return data_dict
 
 # ===================== 3. UI 交互逻辑 =====================
-st.title("🚗 HVFAN 报文分析系统 (修复集成版)")
+st.title("🚗 HVFAN 报文分析系统")
 
 # 侧边栏：处理 DBC 加载
 with st.sidebar:
     st.header("⚙️ 协议库设置")
-    uploaded_dbc = st.file_uploader("手动上传 DBC 文件", type=['dbc'])
+    uploaded_dbc = st.file_uploader("手动上传 DBC 文件", type=['dbc'], key="dbc_loader_key")
     st.caption("提示：若云端环境找不到预设 DBC，请在此处直接上传。")
 
-# 加载 DBC 引擎
-db = load_dbc_engine(uploaded_dbc)
+# 获取 DBC 字节流
+dbc_bytes = uploaded_dbc.read() if uploaded_dbc else None
+db = load_dbc_engine(dbc_bytes)
 
+# 核心逻辑调整：即使没有 DB，也不要 st.stop()，保证页面组件能渲染
 if not db:
-    # 错误提示：对应 image_0e2539.png 中的报错场景
-    st.error(f"❌ 协议库未就绪。请确保本地存在 {DBC_FILENAME} 或通过侧边栏手动上传有效的 DBC 文件。")
-    st.stop()
+    st.info("👈 请先在侧边栏上传 DBC 文件或确保预设 DBC 存在以激活分析功能。")
 else:
-    st.success(f"✅ DBC 解析成功：包含 {len(db.messages)} 条报文定义。")
+    st.success(f"✅ DBC 解析成功：包含 {len(db.messages)} 条报文。")
     
-    # ASC 文件上传
-    uploaded_asc = st.file_uploader("📂 上传 ASC 原始报文文件", type=['asc', 'txt'])
+    # ASC 上传：增加 key 保证移动端稳定性
+    uploaded_asc = st.file_uploader("📂 上传 ASC 原始报文文件", type=['asc', 'txt'], key="asc_uploader_key")
 
     if uploaded_asc is not None:
+        # 使用 session_state 缓存，避免手机端因 UI 刷新导致的重复解析
         file_key = f"data_{uploaded_asc.name}_{uploaded_asc.size}"
         if 'current_file' not in st.session_state or st.session_state.current_file != file_key:
             with st.spinner('🔍 正在解析报文信号...'):
@@ -118,12 +132,12 @@ else:
                 st.session_state.full_data = process_asc(content, db)
                 st.session_state.current_file = file_key
         
-        full_data = st.session_state.full_data
+        full_data = st.session_state.get('full_data', {})
 
         if not full_data:
-            st.warning("⚠️ 解析完成，但未在报文中找到符合 DBC 定义的信号数据。请检查 ID 是否匹配。")
+            st.warning("⚠️ 解析完成，但未在报文中找到符合 DBC 定义的信号数据。")
         else:
-            # 交互控制面板
+            # 交互控制面板 (保留原功能)
             with st.expander("🛠️ 信号显示设置", expanded=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
@@ -139,13 +153,13 @@ else:
                 for name in selected_sigs:
                     d = full_data[name]
                     x, y = d['x'], d['y']
-                    # 数据保护：超过 20k 点进行抽稀处理
+                    # 保留原有的数据抽稀逻辑，优化移动端性能
                     if len(x) > 20000:
                         step = len(x) // 20000
                         x, y = x[::step], y[::step]
                     charts_to_render.append({"id": f"chart_{hash(name)}", "title": f"{name} ({d['unit']})", "x": x, "y": y})
 
-                # --- Plotly 渲染逻辑 ---
+                # --- Plotly 渲染逻辑 (保留同步缩放功能) ---
                 js_logic = f"""
                 <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
                 <div id="chart-container"></div>
@@ -166,13 +180,6 @@ else:
                         container.appendChild(div);
                         chartIds.push(data.id);
 
-                        const trace = {{
-                            x: data.x, y: data.y,
-                            type: 'scatter', mode: 'lines',
-                            line: {{ width: 1.5, color: '#2b6cb0' }},
-                            name: data.title
-                        }};
-
                         const layout = {{
                             title: {{ text: data.title, font: {{ size: 13 }} }},
                             margin: {{ l: 60, r: 30, t: 40, b: 40 }},
@@ -182,7 +189,7 @@ else:
                             yaxis: {{ autorange: true }}
                         }};
 
-                        Plotly.newPlot(data.id, [trace], layout, {{ responsive: true, displaylogo: false }});
+                        Plotly.newPlot(data.id, [{{ x: data.x, y: data.y, type: 'scatter', mode: 'lines', line: {{ width: 1.5, color: '#2b6cb0' }} }}], layout, {{ responsive: true, displaylogo: false }});
 
                         if (syncEnabled) {{
                             document.getElementById(data.id).on('plotly_relayout', (eventData) => {{
